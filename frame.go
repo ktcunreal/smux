@@ -3,6 +3,8 @@ package smux
 import (
 	"encoding/binary"
 	"fmt"
+	"time"
+	"crypto/rand"
 )
 
 const ( // cmds
@@ -34,6 +36,7 @@ const (
 	sizeOfLength = 2
 	sizeOfSid    = 4
 	headerSize   = sizeOfVer + sizeOfCmd + sizeOfSid + sizeOfLength
+	encryptedHeaderSize = 20
 )
 
 // Frame defines a packet from or to be multiplexed into a single connection
@@ -43,6 +46,7 @@ type Frame struct {
 	sid  uint32
 	data []byte
 }
+
 
 func newFrame(version byte, cmd byte, sid uint32) Frame {
 	return Frame{ver: version, cmd: cmd, sid: sid}
@@ -78,4 +82,122 @@ func (h updHeader) Consumed() uint32 {
 }
 func (h updHeader) Window() uint32 {
 	return binary.LittleEndian.Uint32(h[4:])
+}
+
+
+type encryptedHeader struct {
+	eb 		[encryptedHeaderSize]byte
+	pkr 	*Keyring
+}
+
+func NewEncryptedHeader(k *Keyring) *encryptedHeader{
+	e := &encryptedHeader{
+		pkr: k,
+	}
+	return e
+}
+
+func (e *encryptedHeader) Mask() {
+	obfuscator:=[]byte{0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08}
+	m := make([]byte, len(obfuscator) + 6)
+
+	copy(m[:6],e.eb[:6])
+	copy(m[6:],obfuscator)
+	nonce:=SHA256(m)
+
+	// Mask Timestamp
+	copy(e.eb[6:10], XORBytes(e.eb[6:10], nonce))
+
+	// Mask version
+	copy(e.eb[10:11], XORBytes(e.eb[10:11], nonce))
+	
+	// Mask CMD
+	copy(e.eb[11:12], XORBytes(e.eb[11:12], nonce))
+
+	// Mask SID
+	copy(e.eb[12:16], XORBytes(e.eb[12:16], nonce))
+
+	// Mask LEN
+	copy(e.eb[16:18], XORBytes(e.eb[16:18], nonce))
+
+	// Mask CHKSUM
+	copy(e.eb[18:20], XORBytes(e.eb[18:20], nonce))
+}
+
+func (e *encryptedHeader) Unmask() {
+	obfuscator:=[]byte{0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08}
+	m := make([]byte, len(obfuscator) + 6)
+
+	copy(m[:6],e.eb[:6])
+	copy(m[6:],obfuscator)
+	nonce:=SHA256(m)
+
+	// Mask Timestamp
+	copy(e.eb[6:10], XORBytes(e.eb[6:10], nonce))
+
+	// Mask version
+	copy(e.eb[10:11], XORBytes(e.eb[10:11], nonce))
+	
+	// Mask CMD
+	copy(e.eb[11:12], XORBytes(e.eb[11:12], nonce))
+
+	// Mask SID
+	copy(e.eb[12:16], XORBytes(e.eb[12:16], nonce))
+
+	// Mask LEN
+	copy(e.eb[16:18], XORBytes(e.eb[16:18], nonce))
+
+	// Mask CHKSUM
+	copy(e.eb[18:20], XORBytes(e.eb[18:20], nonce))
+}
+
+func (e *encryptedHeader) SetEncryptedHeader(cmd byte, sid uint32, cipherLen uint16){
+	// Set IV
+	rand.Read(e.eb[:6])
+
+	// Set Timestamp
+	binary.LittleEndian.PutUint32(e.eb[6:10], uint32(time.Now().Unix()))
+
+	// Set Version
+	e.eb[10]=0x01
+
+	// Set CMD
+	e.eb[11]=cmd
+
+	// Set SessionID
+	binary.LittleEndian.PutUint32(e.eb[12:16], sid)
+
+	// Set Data length
+	binary.LittleEndian.PutUint16(e.eb[16:18],cipherLen)
+	
+	// Set Checksum
+	copy(e.eb[18:], SHA256(e.eb[:18])[:2])
+}
+
+func (e *encryptedHeader) IV() []byte{
+	return e.eb[:6]
+}
+
+func (e *encryptedHeader) Version() byte{
+	return e.eb[6]
+}
+
+func (e *encryptedHeader) Timestamp() []byte{
+	return e.eb[6:10]
+}
+
+func (e *encryptedHeader) StreamID() uint32{
+	return binary.LittleEndian.Uint32(e.eb[12:16])
+}
+
+func (e *encryptedHeader) Length() uint16{
+	return binary.LittleEndian.Uint16(e.eb[16:18])
+}
+
+func (e *encryptedHeader) CMD() byte{
+	return e.eb[11]
+}
+
+func (e *encryptedHeader) Chksum() []byte{
+	return e.eb[18:20]
 }

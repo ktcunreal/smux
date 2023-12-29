@@ -6,6 +6,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	//"crypto/sha256"
 	"time"
 )
 
@@ -169,10 +170,7 @@ func (s *Stream) tryReadv2(b []byte) (n int, err error) {
 
 // WriteTo implements io.WriteTo
 func (s *Stream) WriteTo(w io.Writer) (n int64, err error) {
-	if s.sess.config.Version == 2 {
-		return s.writeTov2(w)
-	}
-
+	//defer handlePanic()
 	for {
 		var buf []byte
 		s.bufferLock.Lock()
@@ -317,22 +315,35 @@ func (s *Stream) Write(b []byte) (n int, err error) {
 	// frame split and transmit
 	sent := 0
 	frame := newFrame(byte(s.sess.config.Version), cmdPSH, s.id)
+
+	//key:=sha256.Sum256([]byte("111"))
+	//nonce:=[24]byte{}
+	//cipher := secretbox.Seal([]byte{}, b, &nonce, &key)
+
 	bts := b
-	for len(bts) > 0 {
-		sz := len(bts)
-		if sz > s.frameSize {
-			sz = s.frameSize
-		}
-		frame.data = bts[:sz]
-		bts = bts[sz:]
-		n, err := s.sess.writeFrameInternal(frame, deadline, CLSDATA)
-		s.numWritten++
-		sent += n
-		if err != nil {
-			return sent, err
+
+	chunkSize:=1300
+	if chunkSize > len(bts) {
+		chunkSize = len(bts)
+	}
+	chunks := ChunkBytes(bts, chunkSize)
+
+	for i:=0;i<len(chunks); i++ {
+		for len(chunks[i]) > 0 {
+			sz := len(chunks[i])
+			if sz > s.frameSize {
+				sz = s.frameSize
+			}
+			frame.data = chunks[i][:sz]
+			chunks[i] = chunks[i][sz:]
+			n, err := s.sess.writeFrameInternal(frame, deadline, CLSDATA)
+			s.numWritten++
+			sent += n
+			if err != nil {
+				return sent, err
+			}
 		}
 	}
-
 	return sent, nil
 }
 

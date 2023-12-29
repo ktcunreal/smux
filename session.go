@@ -2,13 +2,17 @@ package smux
 
 import (
 	"container/heap"
-	"encoding/binary"
+	//"encoding/binary"
 	"errors"
 	"io"
 	"net"
+	"fmt"
 	"sync"
+	"golang.org/x/crypto/nacl/secretbox"
 	"sync/atomic"
 	"time"
+	//"crypto/sha256"
+	
 )
 
 const (
@@ -45,10 +49,13 @@ type writeResult struct {
 	err error
 }
 
+// 
+
+
 // Session defines a multiplexed connection for streams
 type Session struct {
 	conn io.ReadWriteCloser
-
+	
 	config           *Config
 	nextStreamID     uint32 // next stream identifier
 	nextStreamIDLock sync.Mutex
@@ -86,6 +93,11 @@ type Session struct {
 	requestID uint32            // write request monotonic increasing
 	shaper    chan writeRequest // a shaper for writing
 	writes    chan writeRequest
+
+	isClient	bool
+	ServerSN, ServerRN, ClientSN, ClientRN [24]byte
+	NaclKey [32]byte
+	keyring  *Keyring
 }
 
 func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
@@ -102,11 +114,16 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	s.chSocketReadError = make(chan struct{})
 	s.chSocketWriteError = make(chan struct{})
 	s.chProtoError = make(chan struct{})
+	s.keyring = NewKeyring("abc")
 
 	if client {
 		s.nextStreamID = 1
+		s.isClient = true
+		fmt.Println("is client")
 	} else {
 		s.nextStreamID = 0
+		s.isClient = false
+		fmt.Println("is server")
 	}
 
 	go s.shaperLoop()
@@ -318,9 +335,11 @@ func (s *Session) returnTokens(n int) {
 
 // recvLoop keeps on reading from underlying connection if tokens are available
 func (s *Session) recvLoop() {
-	var hdr rawHeader
+	//var hdr rawHeader
 	var updHdr updHeader
-
+	// var ehdr encryptedHeader
+	ehdr := NewEncryptedHeader(s.keyring)
+	
 	for {
 		for atomic.LoadInt32(&s.bucket) <= 0 && !s.IsClosed() {
 			select {
@@ -331,14 +350,13 @@ func (s *Session) recvLoop() {
 		}
 
 		// read header first
-		if _, err := io.ReadFull(s.conn, hdr[:]); err == nil {
+		if _, err := io.ReadFull(s.conn, ehdr.eb[:]); err == nil {
 			atomic.StoreInt32(&s.dataReady, 1)
-			if hdr.Version() != byte(s.config.Version) {
-				s.notifyProtoError(ErrInvalidProtocol)
-				return
-			}
-			sid := hdr.StreamID()
-			switch hdr.Cmd() {
+			ehdr.Unmask()
+			// Get sid
+			sid := ehdr.StreamID()
+
+			switch ehdr.CMD() {
 			case cmdNOP:
 			case cmdSYN:
 				s.streamLock.Lock()
@@ -359,16 +377,36 @@ func (s *Session) recvLoop() {
 				}
 				s.streamLock.Unlock()
 			case cmdPSH:
-				if hdr.Length() > 0 {
-					newbuf := defaultAllocator.Get(int(hdr.Length()))
-					if written, err := io.ReadFull(s.conn, newbuf); err == nil {
+				if ehdr.Length() > 0 {	
+					ebuf := defaultAllocator.Get(int(ehdr.Length()))
+					if written, err := io.ReadFull(s.conn, ebuf); err == nil {
+						
+						var plain []byte
+						var ok bool
+						copy(s.NaclKey[:], s.keyring.Extract(nil, "nacl"))
+						fmt.Printf("key is %v:\n", s.NaclKey)
+						if s.isClient {
+							plain, ok = secretbox.Open(nil, ebuf[:], &s.ClientRN, &s.NaclKey)
+							if !ok {
+								fmt.Println("Decrypt Failed")
+							} 
+							increment(&s.ClientRN)
+						} else {
+							plain, ok = secretbox.Open(nil, ebuf[:], &s.ServerRN, &s.NaclKey)
+							if !ok {
+								fmt.Println("Decrypt Failed")
+							}
+							increment(&s.ServerRN)	
+						}
+
 						s.streamLock.Lock()
 						if stream, ok := s.streams[sid]; ok {
-							stream.pushBytes(newbuf)
+							stream.pushBytes(plain)
 							atomic.AddInt32(&s.bucket, -int32(written))
 							stream.notifyReadEvent()
 						}
 						s.streamLock.Unlock()
+						
 					} else {
 						s.notifyReadError(err)
 						return
@@ -463,46 +501,91 @@ func (s *Session) shaperLoop() {
 }
 
 func (s *Session) sendLoop() {
-	var buf []byte
 	var n int
 	var err error
-	var vec [][]byte // vector for writeBuffers
-
-	bw, ok := s.conn.(interface {
-		WriteBuffers(v [][]byte) (n int, err error)
-	})
-
-	if ok {
-		buf = make([]byte, headerSize)
-		vec = make([][]byte, 2)
-	} else {
-		buf = make([]byte, (1<<16)+headerSize)
-	}
 
 	for {
 		select {
 		case <-s.die:
 			return
 		case request := <-s.writes:
-			buf[0] = request.frame.ver
-			buf[1] = request.frame.cmd
-			binary.LittleEndian.PutUint16(buf[2:], uint16(len(request.frame.data)))
-			binary.LittleEndian.PutUint32(buf[4:], request.frame.sid)
+			// ehdr := make([]byte, encryptedHeaderSize)
+			// var ehdr encryptedHeader
+			ehdr := NewEncryptedHeader(s.keyring)
+			// Set IV
+			//ehdr.SetIV()
+			// Set version (reserved)
+			//ehdr[6] = 0x01
+			
+			// Set timestamp
+			//ehdr[7] = 0x08
+			//ehdr[9] = 0x11
 
-			if len(vec) > 0 {
-				vec[0] = buf[:headerSize]
-				vec[1] = request.frame.data
-				n, err = bw.WriteBuffers(vec)
+			// set CMD
+			//ehdr[11]=request.frame.cmd
+			//buf[17] = request.frame.cmd
+
+			// set StreamID
+			//binary.LittleEndian.PutUint32(ehdr[12:16], request.frame.sid)
+			//binary.LittleEndian.PutUint32(buf[11:15], request.frame.sid)
+			
+			// Process payload by cmd
+			if request.frame.cmd == 2 {
+				//  Encrypt data block
+				//key:=sha256.Sum256([]byte("111"))
+				//nonce:=[24]byte{}
+
+				var cipher []byte
+				copy(s.NaclKey[:], s.keyring.Extract(nil, "nacl"))
+
+				if s.isClient {
+					cipher = secretbox.Seal([]byte{}, request.frame.data, &s.ClientSN, &s.NaclKey)
+					increment(&s.ClientSN)
+				} else {
+					cipher = secretbox.Seal([]byte{}, request.frame.data, &s.ServerSN, &s.NaclKey)
+					increment(&s.ServerSN)
+				}
+
+				// Set Length
+				//binary.LittleEndian.PutUint16(ehdr[16:18], uint16(len(cipher)))
+				ehdr.SetEncryptedHeader(request.frame.cmd, request.frame.sid, uint16(len(cipher)))
+				ehdr.Mask()
+				// make send buffer and copy cipher to buffer
+				buf := make([]byte, encryptedHeaderSize + len(cipher))
+
+				copy(buf[:encryptedHeaderSize], ehdr.eb[:])
+				copy(buf[encryptedHeaderSize:], cipher)
+				
+				// Write via conn
+				_, err = s.conn.Write(buf[:encryptedHeaderSize+len(cipher)])
+
+				// Set wrote bytes
+				n = len(request.frame.data)
+				if err != nil {
+					n = 0
+				}
 			} else {
-				copy(buf[headerSize:], request.frame.data)
-				n, err = s.conn.Write(buf[:headerSize+len(request.frame.data)])
-			}
+				ehdr.SetEncryptedHeader(request.frame.cmd, request.frame.sid, uint16(len(request.frame.data)))
+				ehdr.Mask()
+				// Set raw data length
+				//binary.LittleEndian.PutUint16(ehdr[16:18], uint16(len(request.frame.data)))
 
-			n -= headerSize
-			if n < 0 {
-				n = 0
-			}
+				// make send buffer and copy raw data to buffer
+				buf := make([]byte, encryptedHeaderSize + len(request.frame.data))
+				
+				copy(buf[:encryptedHeaderSize], ehdr.eb[:])
+				copy(buf[encryptedHeaderSize:], request.frame.data)
 
+				// Write via conn
+				n, err = s.conn.Write(ehdr.eb[:encryptedHeaderSize+len(request.frame.data)])
+	
+				// Set wrote bytes, subtract raw header size from n
+				n -= headerSize
+				if n < 0 {
+					n = 0
+				}
+			}
+			
 			result := writeResult{
 				n:   n,
 				err: err,
